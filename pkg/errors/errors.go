@@ -509,3 +509,14 @@ var INVALID_TX_FILTER = Code[TxFilterMetadata]{
 	"INVALID_TX_FILTER",
 	grpccodes.InvalidArgument,
 }
+
+type IntentAmountMismatchMetadata struct {
+	InputAmount  int `json:"input_amount"`
+	OutputAmount int `json:"output_amount"`
+}
+
+var INTENT_AMOUNT_MISMATCH = Code[IntentAmountMismatchMetadata]{
+	53,
+	"INTENT_AMOUNT_MISMATCH",
+	grpccodes.InvalidArgument,
+}

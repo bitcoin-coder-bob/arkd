@@ -527,6 +527,10 @@ func (b *txBuilder) BuildCommitmentTx(
 	var batchOutputScript []byte
 	var batchOutputAmount int64
 
+	if err := validateReceiverAmounts(intents); err != nil {
+		return "", nil, "", nil, err
+	}
+
 	receivers, err := getOutputVtxosLeaves(intents, cosignersPublicKeys)
 	if err != nil {
 		return "", nil, "", nil, err

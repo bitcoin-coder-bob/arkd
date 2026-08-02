@@ -1512,6 +1512,11 @@ func (s *service) RegisterIntent(
 			WithMetadata(errors.PsbtMetadata{Tx: proof.UnsignedTx.TxID()})
 	}
 
+	if err := proof.ValidateAmounts(); err != nil {
+		return "", errors.INVALID_INTENT_PSBT.New("%s", err).
+			WithMetadata(errors.PsbtMetadata{Tx: proof.UnsignedTx.TxID()})
+	}
+
 	now := time.Now()
 	if message.ValidAt > 0 {
 		validAt := time.Unix(message.ValidAt, 0)
@@ -1862,6 +1867,13 @@ func (s *service) RegisterIntent(
 			continue
 		}
 
+		// amounts are validated upfront, keep the invariant local to the cast
+		if output.Value <= 0 {
+			return "", errors.INVALID_INTENT_PSBT.New(
+				"output %d has invalid amount: %d", outputIndex, output.Value,
+			).WithMetadata(errors.PsbtMetadata{Tx: proofTxid})
+		}
+
 		amount := uint64(output.Value)
 		rcv := domain.Receiver{
 			Amount: amount,
@@ -2087,6 +2099,30 @@ func (s *service) RegisterIntent(
 		if err != nil {
 			return "", err
 		}
+	}
+
+	// The registered outputs must be covered by the amounts the operator itself knows: vtxo
+	// amounts come from the repository, boarding amounts from the confirmed onchain tx.
+	inputAmount := uint64(0)
+	for _, vtxo := range vtxoInputs {
+		// unrolled vtxos re-enter as boarding inputs, counting them on both sides
+		// would let an intent claim twice what it owns
+		if vtxo.Unrolled {
+			continue
+		}
+		inputAmount += vtxo.Amount
+	}
+	for _, boardingInput := range boardingInputs {
+		inputAmount += boardingInput.Amount
+	}
+
+	if outputAmount := intent.TotalOutputAmount(); outputAmount > inputAmount {
+		return "", errors.INTENT_AMOUNT_MISMATCH.New(
+			"sum of outputs %d is higher than sum of inputs %d", outputAmount, inputAmount,
+		).WithMetadata(errors.IntentAmountMismatchMetadata{
+			InputAmount:  int(inputAmount),
+			OutputAmount: int(outputAmount),
+		})
 	}
 
 	if err := s.cache.Intents().Push(
@@ -2357,6 +2393,11 @@ func (s *service) EstimateIntentFee(
 	outpoints := proof.GetOutpoints()
 	if len(outpoints) == 0 {
 		return 0, errors.INVALID_INTENT_PSBT.New("proof misses inputs").
+			WithMetadata(errors.PsbtMetadata{Tx: proof.UnsignedTx.TxID()})
+	}
+
+	if err := proof.ValidateAmounts(); err != nil {
+		return 0, errors.INVALID_INTENT_PSBT.New("%s", err).
 			WithMetadata(errors.PsbtMetadata{Tx: proof.UnsignedTx.TxID()})
 	}
 

@@ -14,6 +14,8 @@ import (
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	"github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -24,7 +26,9 @@ const (
 	connectorAddress = "bc1py00yhcjpcj0k0sqra0etq0u3yy0purmspppsw0shyzyfe8c83tmq5h6kc2"
 	forfeitPubkey    = "020000000000000000000000000000000000000000000000000000000000000002"
 	changeAddress    = "bcrt1qhhq55mut9easvrncy4se8q6vg3crlug7yj4j56"
-	minRelayFeeRate  = 3
+	// mainnet p2wpkh, the builder is constructed with arklib.Bitcoin below
+	onchainTestAddress = "bc1qt4k8lrmgd35vq5yx44rz0k03s3h37v93ddshvw"
+	minRelayFeeRate    = 3
 )
 
 var (
@@ -118,6 +122,75 @@ func TestBuildCommitmentTx(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildCommitmentTxReceiverAmounts pins that the batch builder refuses to turn an out of
+// range receiver amount into a tx output. Receiver amounts are uint64 while wire outputs are
+// int64, so without this the builder crafts a batch paying whatever the intent asked for.
+func TestBuildCommitmentTxReceiverAmounts(t *testing.T) {
+	builder := txbuilder.NewTxBuilder(wallet, nil, arklib.Bitcoin)
+
+	newIntent := func(t *testing.T, offchain uint64, onchain uint64) (domain.Intents, [][]string) {
+		t.Helper()
+		key, err := btcec.NewPrivateKey()
+		require.NoError(t, err)
+		cosignerKey, err := btcec.NewPrivateKey()
+		require.NoError(t, err)
+
+		intents := domain.Intents{{
+			Id:      "intent",
+			Proof:   "proof",
+			Message: "message",
+			Txid:    "txid",
+			Inputs:  []domain.Vtxo{{Amount: 8579}},
+			Receivers: []domain.Receiver{
+				{
+					Amount: offchain,
+					PubKey: hex.EncodeToString(schnorr.SerializePubKey(key.PubKey())),
+				},
+				{Amount: onchain, OnchainAddress: onchainTestAddress},
+			},
+		}}
+		cosigners := [][]string{{
+			hex.EncodeToString(cosignerKey.PubKey().SerializeCompressed()),
+		}}
+		return intents, cosigners
+	}
+
+	t.Run("in range amounts build a batch", func(t *testing.T) {
+		intents, cosigners := newIntent(t, 4000, 4000)
+
+		commitmentTx, _, _, _, err := builder.BuildCommitmentTx(
+			pubkey, intents, []ports.BoardingInput{}, cosigners, vtxoTreeExpiry,
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, commitmentTx)
+	})
+
+	t.Run("wrapped negative offchain amount is refused", func(t *testing.T) {
+		// the value a negative psbt output turns into once cast to uint64
+		negative := int64(-9990961)
+		wrapped := uint64(negative)
+		intents, cosigners := newIntent(t, wrapped, 9999340)
+
+		commitmentTx, vtxoTree, connAddr, _, err := builder.BuildCommitmentTx(
+			pubkey, intents, []ports.BoardingInput{}, cosigners, vtxoTreeExpiry,
+		)
+		require.ErrorContains(t, err, "invalid amount for receiver 0")
+		require.Empty(t, commitmentTx)
+		require.Empty(t, connAddr)
+		require.Nil(t, vtxoTree)
+	})
+
+	t.Run("onchain amount above the satoshi ceiling is refused", func(t *testing.T) {
+		intents, cosigners := newIntent(t, 4000, btcutil.MaxSatoshi+1)
+
+		commitmentTx, _, _, _, err := builder.BuildCommitmentTx(
+			pubkey, intents, []ports.BoardingInput{}, cosigners, vtxoTreeExpiry,
+		)
+		require.ErrorContains(t, err, "invalid amount for receiver 1")
+		require.Empty(t, commitmentTx)
+	})
 }
 
 // TestBuildCommitmentTxUsesVtxoTreeExpiryArg pins that the vtxoTreeExpiry argument is what gets

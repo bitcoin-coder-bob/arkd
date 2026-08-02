@@ -14,6 +14,23 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
+// validateReceiverAmounts rejects intents carrying a receiver amount that cannot be turned into
+// a tx output. Amounts are uint64 here and int64 in the wire outputs, so anything above the
+// satoshi ceiling wraps to a negative or nonsensical value when the batch is crafted.
+func validateReceiverAmounts(intents []domain.Intent) error {
+	for _, intent := range intents {
+		for i, receiver := range intent.Receivers {
+			if receiver.Amount == 0 || receiver.Amount > btcutil.MaxSatoshi {
+				return fmt.Errorf(
+					"intent %s: invalid amount for receiver %d: %d",
+					intent.Id, i, receiver.Amount,
+				)
+			}
+		}
+	}
+	return nil
+}
+
 func getOnchainOutputs(
 	intents []domain.Intent, network *chaincfg.Params,
 ) ([]*wire.TxOut, error) {

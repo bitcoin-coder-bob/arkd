@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/arkade-os/arkd/pkg/ark-lib/intent"
@@ -16,6 +18,7 @@ import (
 	"github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -197,6 +200,180 @@ func TestIntentGetOutpoints(t *testing.T) {
 		proof := intent.Proof{Packet: ptxWithOneInput}
 		outpoints := proof.GetOutpoints()
 		require.Len(t, outpoints, 0)
+	})
+}
+
+// TestIntentAmounts verifies that out of range input and output amounts are rejected before any
+// consumer casts them to uint64, and that the zero-valued toSpend input is excluded from the fee.
+func TestIntentAmounts(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		t.Run("fee is sum of inputs minus sum of outputs", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000, 2000}, []int64{6000, 3800})
+
+			require.NoError(t, proof.ValidateAmounts())
+
+			fees, err := proof.Fees()
+			require.NoError(t, err)
+			require.Equal(t, int64(200), fees)
+		})
+
+		t.Run("toSpend input does not contribute to the fee", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000}, []int64{7800})
+
+			fees, err := proof.Fees()
+			require.NoError(t, err)
+			require.Equal(t, int64(200), fees)
+		})
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		t.Run("negative output amount", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000}, []int64{-9990961, 9999340})
+
+			err := proof.ValidateAmounts()
+			require.ErrorContains(t, err, "invalid amount for output 0")
+
+			_, err = proof.Fees()
+			require.ErrorContains(t, err, "invalid amount for output 0")
+		})
+
+		t.Run("output amount above max satoshi", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000}, []int64{btcutil.MaxSatoshi + 1})
+
+			require.ErrorContains(t, proof.ValidateAmounts(), "invalid amount for output 0")
+		})
+
+		t.Run("negative input amount", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{-8000}, []int64{7800})
+
+			require.ErrorContains(t, proof.ValidateAmounts(), "invalid amount for input 1")
+		})
+
+		t.Run("non-zero toSpend input", func(t *testing.T) {
+			// the toSpend value is not committed to by the signatures, it must stay zero
+			proof := newAmountsProof(10_000_000, []int64{8579}, []int64{330, 9999340})
+
+			err := proof.ValidateAmounts()
+			require.ErrorContains(t, err, "invalid amount for toSpend input")
+
+			_, err = proof.Fees()
+			require.ErrorContains(t, err, "invalid amount for toSpend input")
+		})
+
+		t.Run("missing witness utxo", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000}, []int64{7800})
+			proof.Inputs[1].WitnessUtxo = nil
+
+			require.ErrorContains(t, proof.ValidateAmounts(), "missing witness utxo for input 1")
+		})
+
+		t.Run("outputs exceed inputs", func(t *testing.T) {
+			proof := newAmountsProof(0, []int64{8000}, []int64{9000})
+
+			_, err := proof.Fees()
+			require.ErrorContains(t, err, "sum of inputs is smaller than sum of outputs")
+		})
+
+		t.Run("sum of outputs overflows int64", func(t *testing.T) {
+			// individually valid amounts can still overflow the accumulator
+			count := int(int64(math.MaxInt64)/int64(btcutil.MaxSatoshi)) + 1
+			outputValues := make([]int64, count)
+			for i := range outputValues {
+				outputValues[i] = btcutil.MaxSatoshi
+			}
+			proof := newAmountsProof(0, []int64{8000}, outputValues)
+
+			require.NoError(t, proof.ValidateAmounts())
+
+			_, err := proof.Fees()
+			require.ErrorContains(t, err, "sum of outputs overflows")
+		})
+	})
+
+	// a negative amount paired with a matching positive one keeps the int64 sums balanced,
+	// so the pair has to be caught per output rather than on the totals
+	t.Run("offsetting amounts survive a base64 round trip", func(t *testing.T) {
+		proof := newAmountsProof(0, []int64{8579}, []int64{-9990961, 9999340})
+		encoded := serializeProof(t, &proof)
+
+		ptx, err := psbt.NewFromRawBytes(strings.NewReader(encoded), true)
+		require.NoError(t, err)
+
+		decoded := intent.Proof{Packet: *ptx}
+		require.ErrorContains(t, decoded.ValidateAmounts(), "invalid amount for output 0")
+
+		_, err = decoded.Fees()
+		require.ErrorContains(t, err, "invalid amount for output 0")
+
+		require.Error(t, intent.Verify(encoded, "", nil))
+	})
+
+	// Both shapes below are built so that every total a caller might check still looks
+	// correct. Each subtest first asserts the property that made the shape slip past the
+	// totals, then asserts that validation rejects it anyway. If a guard is ever removed
+	// the second half fails while the first half keeps documenting why that matters.
+	t.Run("shapes that balance on every total", func(t *testing.T) {
+		t.Run("negative output offset by a larger positive one", func(t *testing.T) {
+			const (
+				inputValue    = int64(8579)
+				offchainValue = int64(-9990961)
+				onchainValue  = int64(9999340)
+			)
+			proof := newAmountsProof(0, []int64{inputValue}, []int64{offchainValue, onchainValue})
+
+			// the int64 total is a plausible 200 sat fee
+			require.Equal(t, int64(8379), offchainValue+onchainValue)
+			require.Equal(t, int64(200), inputValue-(offchainValue+onchainValue))
+
+			// and the uint64 total wraps back to the very same number, so summing the
+			// outputs after the cast agrees with the int64 view
+			sum := uint64(0)
+			for _, out := range proof.UnsignedTx.TxOut {
+				sum += uint64(out.Value)
+			}
+			require.Equal(t, uint64(8379), sum)
+
+			// the cast turns the negative output into a value no floor or ceiling catches
+			cast := uint64(proof.UnsignedTx.TxOut[0].Value)
+			require.Greater(t, cast, uint64(btcutil.MaxSatoshi))
+
+			require.ErrorContains(t, proof.ValidateAmounts(), "invalid amount for output 0")
+			_, err := proof.Fees()
+			require.ErrorContains(t, err, "invalid amount for output 0")
+		})
+
+		t.Run("inflated toSpend input with every amount in range", func(t *testing.T) {
+			proof := newAmountsProof(10_000_000, []int64{8579}, []int64{330, 9999340})
+
+			// no per amount check can catch this one: every value is positive and within
+			// range, only the zero-valued toSpend input has been overstated
+			for i, in := range proof.Inputs {
+				require.Positive(t, in.WitnessUtxo.Value+1, "input %d", i)
+				require.LessOrEqual(t, in.WitnessUtxo.Value, int64(btcutil.MaxSatoshi))
+			}
+			for i, out := range proof.UnsignedTx.TxOut {
+				require.Positive(t, out.Value, "output %d", i)
+				require.LessOrEqual(t, out.Value, int64(btcutil.MaxSatoshi))
+			}
+
+			// the toSpend value is what buys the headroom: it is not committed to by any
+			// signature, so counting it would let the outputs exceed the real inputs
+			require.Greater(t, int64(330+9999340), int64(8579))
+
+			require.ErrorContains(t, proof.ValidateAmounts(), "invalid amount for toSpend input")
+			_, err := proof.Fees()
+			require.ErrorContains(t, err, "invalid amount for toSpend input")
+		})
+
+		t.Run("same shape with an honest toSpend cannot fund the outputs", func(t *testing.T) {
+			// drop the overstated toSpend and the outputs no longer fit in the inputs
+			proof := newAmountsProof(0, []int64{8579}, []int64{330, 9999340})
+
+			require.NoError(t, proof.ValidateAmounts())
+
+			_, err := proof.Fees()
+			require.ErrorContains(t, err, "sum of inputs is smaller than sum of outputs")
+		})
 	})
 }
 
@@ -469,4 +646,36 @@ func serializeProof(t *testing.T, p *intent.Proof) string {
 	var buf bytes.Buffer
 	require.NoError(t, p.Serialize(&buf))
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// newAmountsProof builds a proof with the shape expected by ValidateAmounts and Fees: a leading
+// toSpend input followed by the inputs proving ownership. Only the amounts are meaningful, the
+// scripts and outpoints are placeholders.
+func newAmountsProof(toSpendValue int64, inputValues, outputValues []int64) intent.Proof {
+	txIns := []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{}}}
+	pInputs := []psbt.PInput{
+		{WitnessUtxo: &wire.TxOut{Value: toSpendValue, PkScript: []byte{txscript.OP_TRUE}}},
+	}
+
+	for i, value := range inputValues {
+		txIns = append(txIns, &wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{Index: uint32(i + 1)},
+		})
+		pInputs = append(pInputs, psbt.PInput{
+			WitnessUtxo: &wire.TxOut{Value: value, PkScript: []byte{txscript.OP_TRUE}},
+		})
+	}
+
+	txOuts := make([]*wire.TxOut, 0, len(outputValues))
+	pOutputs := make([]psbt.POutput, 0, len(outputValues))
+	for _, value := range outputValues {
+		txOuts = append(txOuts, &wire.TxOut{Value: value, PkScript: []byte{txscript.OP_TRUE}})
+		pOutputs = append(pOutputs, psbt.POutput{})
+	}
+
+	return intent.Proof{Packet: psbt.Packet{
+		UnsignedTx: &wire.MsgTx{Version: 2, TxIn: txIns, TxOut: txOuts},
+		Inputs:     pInputs,
+		Outputs:    pOutputs,
+	}}
 }

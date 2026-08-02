@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/arkade-os/arkd/pkg/ark-lib/note"
@@ -12,6 +13,7 @@ import (
 	"github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -73,6 +75,10 @@ func Verify(proofB64, message string, skip []*btcec.PublicKey) error {
 	prevoutFetcher, err := txutils.GetPrevOutputFetcher(ptx)
 	if err != nil {
 		return err
+	}
+
+	if err := proof.ValidateAmounts(); err != nil {
+		return fmt.Errorf("invalid intent proof: %w", err)
 	}
 
 	// the first input of the tx is always the toSpend tx,
@@ -165,19 +171,57 @@ func New(message string, inputs []Input, outputs []*wire.TxOut) (*Proof, error) 
 	return &Proof{Packet: *toSign}, nil
 }
 
-// Fees returns the implicit fee of the proof transaction (sum of inputs minus sum of outputs).
-func (p Proof) Fees() (int64, error) {
-	sumOfInputs := int64(0)
+// ValidateAmounts checks that every input and output amount of the proof is a valid satoshi
+// value. Amounts are int64 in the psbt and are cast to uint64 by consumers, so out of range
+// values must not reach them. The toSpend input is always zero-valued, see buildToSpendTx.
+func (p Proof) ValidateAmounts() error {
+	if len(p.Inputs) < 2 {
+		return ErrInvalidTxNumberOfInputs
+	}
+
 	for i, input := range p.Inputs {
 		if input.WitnessUtxo == nil {
-			return 0, fmt.Errorf("missing witness utxo for input %d", i)
+			return fmt.Errorf("missing witness utxo for input %d", i)
 		}
-		sumOfInputs += int64(input.WitnessUtxo.Value)
+		if v := input.WitnessUtxo.Value; v < 0 || v > btcutil.MaxSatoshi {
+			return fmt.Errorf("invalid amount for input %d: %d", i, v)
+		}
+	}
+
+	if v := p.Inputs[0].WitnessUtxo.Value; v != 0 {
+		return fmt.Errorf("invalid amount for toSpend input: expected 0, got %d", v)
+	}
+
+	for i, output := range p.UnsignedTx.TxOut {
+		if v := output.Value; v < 0 || v > btcutil.MaxSatoshi {
+			return fmt.Errorf("invalid amount for output %d: %d", i, v)
+		}
+	}
+
+	return nil
+}
+
+// Fees returns the implicit fee of the proof transaction (sum of inputs minus sum of outputs).
+func (p Proof) Fees() (int64, error) {
+	if err := p.ValidateAmounts(); err != nil {
+		return 0, err
+	}
+
+	// the first input is the zero-valued toSpend, it never contributes to the fee
+	sumOfInputs := int64(0)
+	for _, input := range p.Inputs[1:] {
+		if sumOfInputs > math.MaxInt64-input.WitnessUtxo.Value {
+			return 0, fmt.Errorf("sum of inputs overflows")
+		}
+		sumOfInputs += input.WitnessUtxo.Value
 	}
 
 	sumOfOutputs := int64(0)
 	for _, output := range p.UnsignedTx.TxOut {
-		sumOfOutputs += int64(output.Value)
+		if sumOfOutputs > math.MaxInt64-output.Value {
+			return 0, fmt.Errorf("sum of outputs overflows")
+		}
+		sumOfOutputs += output.Value
 	}
 
 	fees := sumOfInputs - sumOfOutputs
